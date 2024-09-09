@@ -114,7 +114,7 @@ class Handler implements \SessionHandlerInterface
     /**
      * Try to break lock for at most this many seconds
      */
-    const DEFAULT_FAIL_AFTER            = 15;
+    const DEFAULT_FAIL_AFTER_SECONDS    = 15;
 
     /**
      * The session lifetime for non-bots on the first write
@@ -189,12 +189,17 @@ class Handler implements \SessionHandlerInterface
     /**
      * @var int
      */
-    protected $_breakAfter;
+    protected $_breakAfterLockTries;
 
     /**
      * @var int
      */
-    protected $_failAfter;
+    protected $_failAfterSeconds;
+
+    /**
+     * @var int
+     */
+    protected $_failAfterLockBreakTries;
 
     /**
      * @var boolean
@@ -288,13 +293,13 @@ class Handler implements \SessionHandlerInterface
         $this->_compressionThreshold =  $this->config->getCompressionThreshold() ?: self::DEFAULT_COMPRESSION_THRESHOLD;
         $this->_compressionLibrary =    $this->config->getCompressionLibrary() ?: self::DEFAULT_COMPRESSION_LIBRARY;
         $this->_maxConcurrency =        $this->config->getMaxConcurrency() ?: self::DEFAULT_MAX_CONCURRENCY;
-        $this->_failAfter =             $this->config->getFailAfter() ?: self::DEFAULT_FAIL_AFTER;
+        $this->_failAfterSeconds =      $this->config->getFailAfter() ?: self::DEFAULT_FAIL_AFTER_SECONDS;
         $this->_maxLifetime =           $this->config->getMaxLifetime() ?: self::DEFAULT_MAX_LIFETIME;
         $this->_minLifetime =           $this->config->getMinLifetime() ?: self::DEFAULT_MIN_LIFETIME;
         $this->_useLocking =            ! $this->config->getDisableLocking();
 
-        // Use sleep time multiplier so fail after time is in seconds
-        $this->_failAfter = (int) round((1000000 / self::SLEEP_TIME) * $this->_failAfter);
+        // Multiply fail after seconds by number of tries per second to get number of write lock breaking tries
+        $this->_failAfterLockBreakTries = (int) round($this->_getLockTriesPerSecond() * $this->_failAfterSeconds);
 
         // Sentinel config
         $sentinelServers =         $this->config->getSentinelServers();
@@ -387,6 +392,16 @@ class Handler implements \SessionHandlerInterface
     }
 
     /**
+     * Get number of write lock tries ran per second
+     *
+     * @return int
+     */
+    protected function _getLockTriesPerSecond(): int
+    {
+        return 1000000 / self::SLEEP_TIME;
+    }
+
+    /**
      * Open session
      *
      * @param string $savePath ignored
@@ -455,7 +470,7 @@ class Handler implements \SessionHandlerInterface
         $tries = $waiting = $lock = 0;
         $lockPid = $oldLockPid = null; // Restart waiting for lock when current lock holder changes
         $detectZombies = false;
-        $breakAfter = $this->_getBreakAfter();
+        $breakAfterTries = $this->_getLockTriesBeforeBreak();
         $timeStart = microtime(true);
         $this->_log(sprintf("Attempting to take lock on ID %s", $sessionId));
 
@@ -467,14 +482,14 @@ class Handler implements \SessionHandlerInterface
             $lock = $this->_redis->hIncrBy($sessionId, 'lock', 1);
 
             // Get the pid of the process that has the lock
-            if ($lock != 1 && $tries + 1 >= $breakAfter) {
+            if ($lock != 1 && $tries + 1 >= $breakAfterTries) {
                 $lockPid = $this->_redis->hGet($sessionId, 'pid');
             }
 
             // If we got the lock, update with our pid and reset lock and expiration
             if (   $lock == 1                          // We actually do have the lock
                 || (
-                    $tries >= $breakAfter   // We are done waiting and want to start trying to break it
+                    $tries >= $breakAfterTries   // We are done waiting and want to start trying to break it
                     && $oldLockPid == $lockPid        // Nobody else got the lock while we were waiting
                 )
             ) {
@@ -571,7 +586,7 @@ class Handler implements \SessionHandlerInterface
                 }
             }
             // Timeout
-            if ($tries >= $breakAfter + $this->_failAfter) {
+            if ($tries >= $breakAfterTries + $this->_failAfterSeconds) {
                 $this->_hasLock = false;
                 $this->_log(
                     sprintf(
@@ -917,20 +932,21 @@ class Handler implements \SessionHandlerInterface
     }
 
     /**
-     * Get break time, calculated later than other config settings due to requiring session name to be set
+     * Get number of lock attempts to try before breaking lock.
+     * This is calculated later than other config settings due to requiring session name to be set
      *
      * @return int
      */
-    protected function _getBreakAfter()
+    protected function _getLockTriesBeforeBreak()
     {
         // Has break after already been calculated? Only fetch from config once, then reuse variable.
-        if (!$this->_breakAfter) {
+        if (!$this->_breakAfterLockTries) {
             // Fetch relevant setting from config using session name
-            $this->_breakAfter = (float)($this->config->getBreakAfter() ?: self::DEFAULT_BREAK_AFTER);
-            // Use sleep time multiplier so break time is in seconds
-            $this->_breakAfter = (int)round((1000000 / self::SLEEP_TIME) * $this->_breakAfter);
+            $breakAfterSeconds = (float)($this->config->getBreakAfter() ?: self::DEFAULT_BREAK_AFTER);
+            // Multiply break after seconds by lock tries per second to get lock tries before break
+            $this->_breakAfterLockTries = (int)round($this->_getLockTriesPerSecond() * $breakAfterSeconds);
         }
 
-        return $this->_breakAfter;
+        return $this->_breakAfterLockTries;
     }
 }
